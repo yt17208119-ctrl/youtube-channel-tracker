@@ -1,7 +1,7 @@
 """
 YouTubeチャンネル日次トラッカー
 - リサーチシートのA列(URL)からハンドルを抽出
-- Socialbladeの埋め込みJSONからデータ取得
+- YouTube Data API v3 でチャンネル統計を取得
 - 分析シートの末尾に1行/チャンネル追記
 """
 import os
@@ -19,11 +19,6 @@ SHEET_ID = "1JmYLo4l1sgNU1IHyD6uFoF4_Vd4p7uyVgW8U4iAKZAI"
 RESEARCH_SHEET = "リサーチシート"
 ANALYSIS_SHEET = "分析シート"
 RESEARCH_RANGE = "A4:C20"
-
-UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
 
 
 def get_gspread_client():
@@ -43,55 +38,54 @@ def extract_handle(url: str):
     return m.group(1) if m else None
 
 
-def fetch_socialblade(handle: str):
-    url = f"https://socialblade.com/youtube/handle/{handle}"
-    r = requests.get(url, headers={"User-Agent": UA}, timeout=30)
-    r.raise_for_status()
-    m = re.search(
-        r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>',
-        r.text,
-        re.DOTALL,
-    )
-    if not m:
-        raise RuntimeError("__NEXT_DATA__ not found")
-    payload = json.loads(m.group(1))
-
-    queries = payload["props"]["pageProps"]["trpcState"]["json"]["queries"]
-
-    user_data = None
-    history = None
-    for q in queries:
-        key = q.get("queryKey", [[]])[0]
-        if isinstance(key, list) and len(key) >= 2:
-            if key[0] == "youtube" and key[1] == "user":
-                user_data = q["state"]["data"]
-            elif key[0] == "youtube" and key[1] == "history":
-                history = q["state"]["data"]
-
-    if not user_data or not history:
-        raise RuntimeError("user/history data missing")
-
-    today = history[-1]
-    prev = history[-2] if len(history) >= 2 else None
-
-    sub_rank = (user_data.get("ranks") or {}).get("subscribers")
-
-    return {
-        "name": user_data.get("display_name", handle),
-        "subs": int(user_data.get("subscribers") or 0),
-        "views": int(user_data.get("views") or 0),
-        "videos": int(user_data.get("videos") or 0),
-        "d_subs": (today["subscribers"] - prev["subscribers"]) if prev else 0,
-        "d_views": (today["views"] - prev["views"]) if prev else 0,
-        "d_videos": (today["videos"] - prev["videos"]) if prev else 0,
-        "grade": user_data.get("grade") or "TBD",
-        "sub_rank": sub_rank if sub_rank is not None else "—",
+def fetch_youtube_api(handle: str, api_key: str):
+    """YouTube Data API v3 でチャンネル情報を取得する"""
+    url = "https://www.googleapis.com/youtube/v3/channels"
+    params = {
+        "part": "snippet,statistics",
+        "forHandle": handle,
+        "key": api_key,
     }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    items = data.get("items", [])
+    if not items:
+        raise ValueError(f"Channel not found for handle: @{handle}")
+    item = items[0]
+    stats = item["statistics"]
+    return {
+        "name": item["snippet"]["title"],
+        "subs": int(stats.get("subscriberCount", 0)),
+        "views": int(stats.get("viewCount", 0)),
+        "videos": int(stats.get("videoCount", 0)),
+    }
+
+
+def get_last_row(analysis, handle_name: str):
+    """分析シートから前回のデータを取得してデルタ計算に使う"""
+    try:
+        all_rows = analysis.get_all_values()
+        for row in reversed(all_rows[1:]):
+            if len(row) >= 5 and row[1] == handle_name:
+                return {
+                    "subs": int(str(row[2]).replace(",", "") or 0),
+                    "views": int(str(row[3]).replace(",", "") or 0),
+                    "videos": int(str(row[4]).replace(",", "") or 0),
+                }
+    except Exception:
+        pass
+    return None
 
 
 def main():
     jst = timezone(timedelta(hours=9))
     today_str = datetime.now(jst).strftime("%Y-%m-%d")
+
+    api_key = os.environ.get("YOUTUBE_API_KEY", "")
+    if not api_key:
+        print("[fatal] YOUTUBE_API_KEY is not set")
+        sys.exit(1)
 
     gc = get_gspread_client()
     sh = gc.open_by_key(SHEET_ID)
@@ -113,25 +107,31 @@ def main():
             print(f"[skip] row {i}: handle not found in {url}")
             continue
         try:
-            print(f"[fetch] {handle}")
-            d = fetch_socialblade(handle)
+            print(f"[fetch] @{handle}")
+            d = fetch_youtube_api(handle, api_key)
+
+            prev = get_last_row(analysis, d["name"])
+            d_subs = d["subs"] - prev["subs"] if prev else 0
+            d_views = d["views"] - prev["views"] if prev else 0
+            d_videos = d["videos"] - prev["videos"] if prev else 0
+
             new_rows.append([
                 today_str,
                 d["name"],
                 d["subs"],
                 d["views"],
                 d["videos"],
-                d["d_subs"],
-                d["d_views"],
-                d["d_videos"],
+                d_subs,
+                d_views,
+                d_videos,
                 0,
                 0,
-                d["grade"],
-                d["sub_rank"],
+                "—",
+                "—",
             ])
-            time.sleep(2)
+            time.sleep(1)
         except Exception as e:
-            msg = f"[error] {handle}: {e}"
+            msg = f"[error] @{handle}: {e}"
             print(msg)
             errors.append(msg)
 
