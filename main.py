@@ -3,6 +3,7 @@ YouTubeチャンネル日次トラッカー
 - リサーチシートのA列(URL)からハンドルを抽出
 - YouTube Data API v3 でチャンネル統計を取得
 - 分析シートの末尾に1行/チャンネル追記
+- 複数スプレッドシートに対応
 """
 import os
 import re
@@ -15,7 +16,12 @@ import requests
 import gspread
 from google.oauth2.service_account import Credentials
 
-SHEET_ID = "1JmYLo4l1sgNU1IHyD6uFoF4_Vd4p7uyVgW8U4iAKZAI"
+# 対象スプレッドシート一覧（追加する場合はここにIDを追記）
+SHEET_IDS = [
+    "1JmYLo4l1sgNU1IHyD6uFoF4_Vd4p7uyVgW8U4iAKZAI",  # Deep Focus チャンネル分析
+    "1ppaeWXLKf29t2puXev7OLvQLZcjhXaC8e_cPXjjmD1s",  # cozy zazz チャンネル分析
+]
+
 RESEARCH_SHEET = "リサーチシート"
 ANALYSIS_SHEET = "分析シート"
 RESEARCH_RANGE = "A4:C20"
@@ -78,18 +84,10 @@ def get_last_row(analysis, handle_name: str):
     return None
 
 
-def main():
-    jst = timezone(timedelta(hours=9))
-    today_str = datetime.now(jst).strftime("%Y-%m-%d")
-
-    api_key = os.environ.get("YOUTUBE_API_KEY", "")
-    if not api_key:
-        print("[fatal] YOUTUBE_API_KEY is not set")
-        sys.exit(1)
-
-    gc = get_gspread_client()
-    sh = gc.open_by_key(SHEET_ID)
-
+def process_spreadsheet(gc, sheet_id: str, today_str: str, api_key: str):
+    """1つのスプレッドシートを処理する"""
+    print(f"\n=== Processing sheet: {sheet_id} ===")
+    sh = gc.open_by_key(sheet_id)
     research = sh.worksheet(RESEARCH_SHEET)
     analysis = sh.worksheet(ANALYSIS_SHEET)
 
@@ -126,8 +124,8 @@ def main():
                 d_videos,
                 0,
                 0,
-                "—",
-                "—",
+                "—",   # grade (YouTube API では取得不可)
+                "—",   # sub_rank (YouTube API では取得不可)
             ])
             time.sleep(1)
         except Exception as e:
@@ -141,12 +139,41 @@ def main():
     else:
         print("No rows to append")
 
-    if errors:
+    return new_rows, errors
+
+
+def main():
+    jst = timezone(timedelta(hours=9))
+    today_str = datetime.now(jst).strftime("%Y-%m-%d")
+
+    api_key = os.environ.get("YOUTUBE_API_KEY", "")
+    if not api_key:
+        print("[fatal] YOUTUBE_API_KEY is not set")
+        sys.exit(1)
+
+    gc = get_gspread_client()
+
+    all_errors = []
+    any_success = False
+
+    for sheet_id in SHEET_IDS:
+        try:
+            new_rows, errors = process_spreadsheet(gc, sheet_id, today_str, api_key)
+            if new_rows:
+                any_success = True
+            all_errors.extend(errors)
+        except Exception as e:
+            msg = f"[fatal] sheet {sheet_id}: {e}"
+            print(msg)
+            all_errors.append(msg)
+
+    if all_errors:
         print("\n--- Errors ---")
-        for e in errors:
+        for e in all_errors:
             print(e)
-        if not new_rows:
-            sys.exit(1)
+
+    if not any_success:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
